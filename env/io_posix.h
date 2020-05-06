@@ -15,6 +15,8 @@
 #include <unistd.h>
 #include <atomic>
 #include <string>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include "rocksdb/env.h"
 #include "util/thread_local.h"
 #include "rocksdb/file_system.h"
@@ -117,6 +119,7 @@ class PosixRandomAccessFile : public FSRandomAccessFile {
   int fd_;
   bool use_direct_io_;
   size_t logical_sector_size_;
+  uint64_t dbg_fileid;
 #if defined(ROCKSDB_IOURING_PRESENT)
   ThreadLocalPtr* thread_local_io_urings_;
 #endif
@@ -160,6 +163,7 @@ class PosixWritableFile : public FSWritableFile {
   int fd_;
   uint64_t filesize_;
   size_t logical_sector_size_;
+  uint64_t dbg_fileid;
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   bool allow_fallocate_;
   bool fallocate_with_keep_size_;

@@ -37,11 +37,14 @@
 #include "util/autovector.h"
 #include "util/coding.h"
 #include "util/string_util.h"
+#include <list>
 
 #if defined(OS_LINUX) && !defined(F_SET_RW_HINT)
 #define F_LINUX_SPECIFIC_BASE 1024
 #define F_SET_RW_HINT (F_LINUX_SPECIFIC_BASE + 12)
 #endif
+
+#include "../../../ycsb/ioaccounting.h"
 
 namespace rocksdb {
 
@@ -85,6 +88,8 @@ bool PosixWrite(int fd, const char* buf, size_t nbyte) {
     left -= done;
     src += done;
   }
+  IOAccounting::record.write_count += 1;
+  IOAccounting::record.write_bytes += nbyte;
   return true;
 }
 
@@ -109,6 +114,8 @@ bool PosixPositionedWrite(int fd, const char* buf, size_t nbyte, off_t offset) {
     src += done;
   }
 
+  IOAccounting::record.write_count += 1;
+  IOAccounting::record.write_bytes += nbyte;
   return true;
 }
 
@@ -287,6 +294,8 @@ IOStatus PosixSequentialFile::Read(size_t n, const IOOptions& /*opts*/,
       s = IOError("While reading file sequentially", filename_, errno);
     }
   }
+  IOAccounting::record.read_count += 1;
+  IOAccounting::record.read_bytes += n;
   return s;
 }
 
@@ -327,6 +336,8 @@ IOStatus PosixSequentialFile::PositionedRead(uint64_t offset, size_t n,
         filename_, errno);
   }
   *result = Slice(scratch, (r < 0) ? 0 : n - left);
+  IOAccounting::record.read_count += 1;
+  IOAccounting::record.read_bytes += n;
   return s;
 }
 
@@ -409,6 +420,22 @@ size_t PosixHelper::GetUniqueIdFromFile(int fd, char* id, size_t max_size) {
   return static_cast<size_t>(rid - id);
 }
 #endif
+
+uint64_t get_fileid_from_filename(const char* filename) {
+  const char* fnumstr = index(filename, '0');
+  int fnum = 0;
+  if (fnumstr != NULL) {
+    fnum = atoi(fnumstr);
+  }
+  return fnum;
+//  struct stat statbuf;
+//  int rc = fstat(fd_, &statbuf);
+//  assert(rc==0);
+//  (void) rc;
+//  printf("praf inod %8ld fnum %d fn %s\n", dbg_inode, fnum, cfname);
+//  //dbg_inode = statbuf.st_ino;
+}
+
 /*
  * PosixRandomAccessFile
  *
@@ -432,9 +459,104 @@ PosixRandomAccessFile::PosixRandomAccessFile(
 {
   assert(!options.use_direct_reads || !options.use_mmap_reads);
   assert(!options.use_mmap_reads || sizeof(void*) < 8);
+
+  dbg_fileid = get_fileid_from_filename(fname.c_str());
 }
 
 PosixRandomAccessFile::~PosixRandomAccessFile() { close(fd_); }
+
+// LRU cache from:
+// https://www.geeksforgeeks.org/lru-cache-implementation/
+class LruCache {
+  // The actual queue of page numbers maintained in LRU order.
+  std::list<uint64_t> lru_queue;
+  // An index from page number to position in list to make lookup & removal fast.
+  std::unordered_map<uint64_t, std::list<uint64_t>::iterator> index;
+  size_t cache_size_pages;
+public:
+  LruCache(size_t cache_size_pages_) : cache_size_pages(cache_size_pages_) { }
+  uint64_t get_capacity() { return cache_size_pages; }
+  uint64_t get_occupancy() { return index.size(); }
+
+  // Returns true if the page hit in the cache.
+  bool refer(uint64_t page_number);
+};
+
+bool LruCache::refer(uint64_t page_number) {
+  bool hit;
+  if (index.find(page_number) == index.end()) {
+    // page absent from cache -- miss
+    hit = false;
+    if (lru_queue.size() >= cache_size_pages) {
+      // need to evict.
+      uint64_t oldest = lru_queue.back();
+      lru_queue.pop_back();
+      index.erase(oldest);
+    }
+  } else {
+    // page present in cache -- hit
+    hit = true;
+    lru_queue.erase(index[page_number]);
+  }
+  // Intermediate invariant: page is removed from queue. May or may not appear in index.
+  // Insert page_number at the front of the list.
+  lru_queue.push_front(page_number);
+  index[page_number] = lru_queue.begin();
+  return hit;
+}
+
+void testLruCache() {
+  LruCache testCache(100);
+  uint64_t hits = 0;
+  uint64_t tries = 100000;
+  for (uint64_t i=0; i<tries; i++) {
+    uint64_t ref = rand() % 2000;
+    bool hit = testCache.refer(ref);
+    if (hit) { hits += 1; }
+  }
+  printf("accesses %lu hits %lu\n", tries, hits);
+}
+
+static port::Mutex lruCacheMutex;
+static LruCache lruCache(1<<(30-12));
+static uint64_t hit_count = 0;
+static uint64_t read_count = 0;
+static uint64_t write_count = 0;
+
+//static bool tested = false;
+//
+enum Mode { READ, WRITE };
+
+void dbg_access(Mode mode, uint64_t dbg_fileid, uint64_t offset, size_t len)
+{
+//  if (!tested) { testLruCache(); tested = true; }
+
+  //printf("read %lx %lx %lx\n", offset, len, offset+len);
+  uint64_t startPage = offset >> 12;
+  uint64_t endPage = (offset + len - 1) >> 12;
+//  uint64_t pageCount = endPage - startPage + 1;
+//  printf("read %lx %lx %lx\n", dbg_fileid, startPage, pageCount);
+  {
+    MutexLock lock(&lruCacheMutex);
+    for (uint64_t page = startPage; page <= endPage; page++) {
+      uint64_t page_id = dbg_fileid << 32 | page;
+      bool hit = lruCache.refer(page_id);
+      if (mode==READ) {
+        read_count += 1;
+        if (hit) {
+          hit_count += 1;
+        }
+      } else {
+        write_count += 1;
+      }
+    }
+  }
+}
+
+void display_io_model()
+{
+  printf("rocks_io_model cache_occupancy %lu capacity %lu reads %lu hits %lu writes %lu\n", lruCache.get_occupancy(), lruCache.get_capacity(), read_count, hit_count, write_count);
+}
 
 IOStatus PosixRandomAccessFile::Read(uint64_t offset, size_t n,
                                      const IOOptions& /*opts*/, Slice* result,
@@ -457,6 +579,7 @@ IOStatus PosixRandomAccessFile::Read(uint64_t offset, size_t n,
       }
       break;
     }
+    dbg_access(READ, dbg_fileid, offset, r);
     ptr += r;
     offset += r;
     left -= r;
@@ -474,6 +597,9 @@ IOStatus PosixRandomAccessFile::Read(uint64_t offset, size_t n,
         filename_, errno);
   }
   *result = Slice(scratch, (r < 0) ? 0 : n - left);
+
+  IOAccounting::record.read_count += 1;
+  IOAccounting::record.read_bytes += n;
   return s;
 }
 
@@ -563,8 +689,10 @@ IOStatus PosixRandomAccessFile::MultiRead(FSReadRequest* reqs,
     num_reqs -= this_reqs;
     reqs_off += this_reqs;
   }
+  assert(false);  // jonh: need to add IOAccounting
   return IOStatus::OK();
 #else
+  assert(false);  // jonh: need to add IOAccounting
   return FSRandomAccessFile::MultiRead(reqs, num_reqs, options, dbg);
 #endif
 }
@@ -656,6 +784,7 @@ PosixMmapReadableFile::PosixMmapReadableFile(const int fd,
                                              void* base, size_t length,
                                              const EnvOptions& options)
     : fd_(fd), filename_(fname), mmapped_region_(base), length_(length) {
+  assert(false);  // jonh: need to add IOAccounting, which will be hard for mmap!
 #ifdef NDEBUG
   (void)options;
 #endif
@@ -799,6 +928,7 @@ PosixMmapFile::PosixMmapFile(const std::string& fname, int fd, size_t page_size,
       dst_(nullptr),
       last_sync_(nullptr),
       file_offset_(0) {
+  assert(false);  // jonh: need to add IOAccounting, which will be hard for mmap!
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   allow_fallocate_ = options.allow_fallocate;
   fallocate_with_keep_size_ = options.fallocate_with_keep_size;
@@ -968,6 +1098,7 @@ PosixWritableFile::PosixWritableFile(const std::string& fname, int fd,
 #ifdef ROCKSDB_RANGESYNC_PRESENT
   sync_file_range_supported_ = IsSyncFileRangeSupported(fd_);
 #endif  // ROCKSDB_RANGESYNC_PRESENT
+  dbg_fileid = get_fileid_from_filename(fname.c_str());
   assert(!options.use_mmap_writes);
 }
 
@@ -989,6 +1120,7 @@ IOStatus PosixWritableFile::Append(const Slice& data, const IOOptions& /*opts*/,
   if (!PosixWrite(fd_, src, nbytes)) {
     return IOError("While appending to file", filename_, errno);
   }
+  dbg_access(WRITE, dbg_fileid, filesize_, nbytes);
 
   filesize_ += nbytes;
   return IOStatus::OK();
