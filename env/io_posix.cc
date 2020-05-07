@@ -70,6 +70,8 @@ namespace {
 // the writes aligned.
 
 bool PosixWrite(int fd, const char* buf, size_t nbyte) {
+  unsigned long clockStart = __rdtsc();
+
   const size_t kLimit1Gb = 1UL << 30;
 
   const char* src = buf;
@@ -88,6 +90,9 @@ bool PosixWrite(int fd, const char* buf, size_t nbyte) {
     left -= done;
     src += done;
   }
+
+  unsigned long clockEnd = __rdtsc();
+  IOAccounting::record_write_latency(clockEnd - clockStart);
   IOAccounting::record.write_count += 1;
   IOAccounting::record.write_bytes += nbyte;
   return true;
@@ -562,6 +567,7 @@ IOStatus PosixRandomAccessFile::Read(uint64_t offset, size_t n,
                                      const IOOptions& /*opts*/, Slice* result,
                                      char* scratch,
                                      IODebugContext* /*dbg*/) const {
+  unsigned long clockStart = __rdtsc();
   if (use_direct_io()) {
     assert(IsSectorAligned(offset, GetRequiredBufferAlignment()));
     assert(IsSectorAligned(n, GetRequiredBufferAlignment()));
@@ -598,6 +604,8 @@ IOStatus PosixRandomAccessFile::Read(uint64_t offset, size_t n,
   }
   *result = Slice(scratch, (r < 0) ? 0 : n - left);
 
+  unsigned long clockEnd = __rdtsc();
+  IOAccounting::record_read_latency(clockEnd - clockStart);
   IOAccounting::record.read_count += 1;
   IOAccounting::record.read_bytes += n;
   return s;
